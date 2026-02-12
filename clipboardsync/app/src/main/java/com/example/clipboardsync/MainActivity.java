@@ -5,7 +5,6 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
@@ -13,8 +12,12 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
+import android.view.Gravity;
+import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 
@@ -39,42 +42,90 @@ public class MainActivity extends AppCompatActivity {
         prefs = getSharedPreferences("AppPrefs", MODE_PRIVATE);
 
         // --- HEADLESS SHARE HANDLING ---
-        // If the app was opened via the Android Share Menu, process the data and close instantly.
         Intent intent = getIntent();
         if (intent != null && Intent.ACTION_SEND.equals(intent.getAction())) {
             handleIncomingIntent(intent);
-            finish(); // Close immediately to keep the user in the Gallery/Source app
-            return;   // Skip drawing the UI completely
+            finish();
+            return;
         }
 
-        // --- NORMAL UI SETUP ---
-        android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
-        layout.setOrientation(android.widget.LinearLayout.VERTICAL);
-        layout.setPadding(50, 50, 50, 50);
+        // --- UI SETUP WITH SCROLLVIEW (FIXES CUT OFF ISSUES) ---
+        ScrollView scrollView = new ScrollView(this);
+        // Explicitly Match Parent to fill screen
+        scrollView.setLayoutParams(new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+        ));
 
+        android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
+        layout.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+        ));
+        layout.setOrientation(android.widget.LinearLayout.VERTICAL);
+
+        // Use DP instead of fixed pixels for padding
+        int padding = dpToPx(24);
+        layout.setPadding(padding, padding, padding, padding);
+        layout.setGravity(Gravity.CENTER_HORIZONTAL);
+
+        // Title
+        TextView title = new TextView(this);
+        title.setText("Clipboard Sync");
+        title.setTextSize(24f);
+        title.setGravity(Gravity.CENTER);
+        title.setPadding(0, 0, 0, dpToPx(16));
+        title.setTextColor(Color.WHITE);
+
+        // IP Input
         ipInput = new EditText(this);
         ipInput.setHint("Enter PC IP Address");
         ipInput.setText(prefs.getString("ServerIP", ""));
+        ipInput.setBackgroundColor(Color.DKGRAY);
+        ipInput.setTextColor(Color.WHITE);
+        int inputPadding = dpToPx(12);
+        ipInput.setPadding(inputPadding, inputPadding, inputPadding, inputPadding);
+
+        // Buttons
+        // We use MATCH_PARENT width for buttons to ensure they are easy to tap
+        android.widget.LinearLayout.LayoutParams btnParams = new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+        );
 
         saveBtn = new Button(this);
         saveBtn.setText("Save IP");
+        saveBtn.setLayoutParams(btnParams);
 
         manualSendBtn = new Button(this);
         manualSendBtn.setText("📤 SEND CLIPBOARD TO PC NOW");
+        manualSendBtn.setLayoutParams(btnParams);
 
         floatingBtn = new Button(this);
         floatingBtn.setText("🔵 Enable Floating Button");
+        floatingBtn.setLayoutParams(btnParams);
 
         permissionBtn = new Button(this);
         permissionBtn.setText("Allow Display Over Apps (Required)");
+        permissionBtn.setLayoutParams(btnParams);
 
+        // Add everything to layout with spacing (converted to DP)
+        layout.addView(title);
         layout.addView(ipInput);
+        layout.addView(createSpacer(dpToPx(20)));
         layout.addView(saveBtn);
+        layout.addView(createSpacer(dpToPx(20)));
         layout.addView(manualSendBtn);
+        layout.addView(createSpacer(dpToPx(20)));
         layout.addView(floatingBtn);
+        layout.addView(createSpacer(dpToPx(20)));
         layout.addView(permissionBtn);
 
-        setContentView(layout);
+        // Add Layout to ScrollView
+        scrollView.addView(layout);
+        setContentView(scrollView);
+
+        // --- LISTENERS ---
 
         saveBtn.setOnClickListener(v -> {
             String ip = ipInput.getText().toString().trim();
@@ -84,6 +135,11 @@ public class MainActivity extends AppCompatActivity {
             }
             prefs.edit().putString("ServerIP", ip).apply();
             Toast.makeText(this, "IP Saved!", Toast.LENGTH_SHORT).show();
+            // Try to hide keyboard
+            try {
+                android.view.inputmethod.InputMethodManager imm = (android.view.inputmethod.InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                imm.hideSoftInputFromWindow(v.getWindowToken(), 0);
+            } catch (Exception e) {}
         });
 
         manualSendBtn.setOnClickListener(v -> performManualSync(prefs.getString("ServerIP", "")));
@@ -110,8 +166,22 @@ public class MainActivity extends AppCompatActivity {
             moveTaskToBack(true);
         });
 
-        // Handle Floating Button intents if the UI did load
         handleIncomingIntent(getIntent());
+    }
+
+    // Helper to convert dp to px for consistent sizing
+    private int dpToPx(int dp) {
+        float density = getResources().getDisplayMetrics().density;
+        return Math.round(dp * density);
+    }
+
+    // Helper to create empty space between buttons
+    private android.view.View createSpacer(int heightPx) {
+        android.view.View view = new android.view.View(this);
+        view.setLayoutParams(new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                heightPx));
+        return view;
     }
 
     @Override
@@ -136,15 +206,11 @@ public class MainActivity extends AppCompatActivity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-
-        // If the app was already open in the background and a share intent comes in,
-        // process it and push the app back out of the way.
         if (intent != null && Intent.ACTION_SEND.equals(intent.getAction())) {
             handleIncomingIntent(intent);
             moveTaskToBack(true);
             return;
         }
-
         handleIncomingIntent(intent);
     }
 
@@ -155,7 +221,6 @@ public class MainActivity extends AppCompatActivity {
         String type = intent.getType();
         String ip = prefs.getString("ServerIP", "");
 
-        // --- 1. HANDLE FLOATING BUTTON AUTO-SEND ---
         if (intent.getBooleanExtra("AUTO_SEND", false)) {
             new Handler(Looper.getMainLooper()).postDelayed(() -> {
                 if (!ip.isEmpty()) {
@@ -167,7 +232,6 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        // --- 2. HANDLE NATIVE "SHARE TO APP" MENU ---
         if (Intent.ACTION_SEND.equals(action) && type != null) {
             if (ip.isEmpty()) {
                 Toast.makeText(getApplicationContext(), "Please save PC IP in the app first!", Toast.LENGTH_LONG).show();
@@ -187,7 +251,6 @@ public class MainActivity extends AppCompatActivity {
                     int sendType = type.startsWith("video/") ? 3 : 2;
                     Toast.makeText(getApplicationContext(), "Sending shared media...", Toast.LENGTH_SHORT).show();
 
-                    // Read and send in background thread
                     new Thread(() -> {
                         byte[] data = getBytesFromUri(fileUri);
                         if (data != null) {
@@ -202,7 +265,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // --- READS THE CLIPBOARD MANUALLY ---
     private void performManualSync(String ip) {
         if (ip.isEmpty()) {
             Toast.makeText(getApplicationContext(), "Save IP first", Toast.LENGTH_SHORT).show();
@@ -223,16 +285,16 @@ public class MainActivity extends AppCompatActivity {
                 byte[] data = null;
 
                 if (item.getText() != null) {
-                    type = 1; // Text
+                    type = 1;
                     data = item.getText().toString().getBytes("UTF-8");
                 } else if (item.getUri() != null) {
                     Uri uri = item.getUri();
                     String mimeType = getContentResolver().getType(uri);
 
                     if (mimeType != null && mimeType.startsWith("video/")) {
-                        type = 3; // Video
+                        type = 3;
                     } else {
-                        type = 2; // Default to Image
+                        type = 2;
                     }
                     data = getBytesFromUri(uri);
                 }
@@ -249,7 +311,6 @@ public class MainActivity extends AppCompatActivity {
         }).start();
     }
 
-    // --- REUSABLE NETWORK SENDER ---
     private void sendToPcNetwork(String ip, int type, byte[] data) {
         new Thread(() -> {
             try {
