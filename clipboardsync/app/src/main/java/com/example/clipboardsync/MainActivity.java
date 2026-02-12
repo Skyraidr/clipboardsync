@@ -28,7 +28,7 @@ public class MainActivity extends AppCompatActivity {
     private EditText ipInput;
     private Button saveBtn;
     private Button manualSendBtn;
-    private Button floatingBtn; // New Button to toggle floating icon
+    private Button floatingBtn;
     private Button permissionBtn;
     private SharedPreferences prefs;
 
@@ -52,7 +52,7 @@ public class MainActivity extends AppCompatActivity {
         manualSendBtn = new Button(this);
         manualSendBtn.setText("📤 SEND TO PC NOW");
 
-        // --- NEW FLOATING BUTTON CONTROLLER ---
+        // --- FLOATING BUTTON CONTROLLER ---
         floatingBtn = new Button(this);
         floatingBtn.setText("🔵 Enable Floating Button");
 
@@ -62,7 +62,7 @@ public class MainActivity extends AppCompatActivity {
         layout.addView(ipInput);
         layout.addView(saveBtn);
         layout.addView(manualSendBtn);
-        layout.addView(floatingBtn); // Add to layout
+        layout.addView(floatingBtn);
         layout.addView(permissionBtn);
 
         setContentView(layout);
@@ -97,8 +97,6 @@ public class MainActivity extends AppCompatActivity {
             }
 
             Intent serviceIntent = new Intent(MainActivity.this, FloatingButtonService.class);
-            // Simple toggle logic (Stop if running, Start if not - roughly)
-            // For simplicity, we just start it. To stop, you'd usually add a 'stop' button or persistent notification.
             startService(serviceIntent);
             Toast.makeText(this, "Floating Button Started!", Toast.LENGTH_SHORT).show();
 
@@ -138,20 +136,15 @@ public class MainActivity extends AppCompatActivity {
 
     private void handleAutoSend(Intent intent) {
         if (intent != null && intent.getBooleanExtra("AUTO_SEND", false)) {
-            // FIX: Add a delay!
-            // When the floating button launches the app, it takes a few hundred milliseconds
-            // for the window to gain focus. If we read too fast, Android denies access
-            // and reports "Clipboard Empty".
+            // Delay ensures window focus before reading clipboard
             new Handler(Looper.getMainLooper()).postDelayed(() -> {
                 String ip = prefs.getString("ServerIP", "");
                 if (!ip.isEmpty()) {
                     performManualSync(ip);
-                    // Optional: Minimize back automatically after sending?
-                    // moveTaskToBack(true);
                 } else {
                     Toast.makeText(this, "IP not set!", Toast.LENGTH_SHORT).show();
                 }
-            }, 500); // 500ms delay to ensure focus
+            }, 500);
         }
     }
 
@@ -178,8 +171,17 @@ public class MainActivity extends AppCompatActivity {
                     type = 1; // Text
                     data = item.getText().toString().getBytes("UTF-8");
                 } else if (item.getUri() != null) {
-                    type = 2; // Image
-                    data = getBytesFromUri(item.getUri());
+                    Uri uri = item.getUri();
+                    String mimeType = getContentResolver().getType(uri);
+
+                    // Determine if it is Image or Video
+                    if (mimeType != null && mimeType.startsWith("video/")) {
+                        type = 3; // Video
+                    } else {
+                        type = 2; // Default to Image for URIs
+                    }
+
+                    data = getBytesFromUri(uri);
                 }
 
                 if (data == null) return;
