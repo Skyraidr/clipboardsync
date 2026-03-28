@@ -3,12 +3,15 @@ package application;
 import javax.swing.*;
 import java.awt.*;
 import java.awt.datatransfer.*;
+import java.awt.event.KeyEvent;
 import java.awt.image.BufferedImage;
 import java.io.*;
 import java.net.*;
 import java.util.Enumeration;
-import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.imageio.ImageIO;
 
@@ -17,7 +20,7 @@ public class ClipboardSyncDesktop extends JFrame {
     private JTextArea logArea;
     private ServerSocket serverSocket;
     private Clipboard systemClipboard;
-    private JTextField ipField;
+    private JComboBox<String> ipDropdown;
     
     // Target IP address
     private volatile String targetIp = null; 
@@ -31,7 +34,7 @@ public class ClipboardSyncDesktop extends JFrame {
 
     public ClipboardSyncDesktop() {
         setTitle("PC Clipboard Sync Server");
-        setSize(700, 500);
+        setSize(750, 500);
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setLayout(new BorderLayout());
 
@@ -44,21 +47,44 @@ public class ClipboardSyncDesktop extends JFrame {
         
         topPanel.add(new Box.Filler(new Dimension(20, 0), new Dimension(20, 0), new Dimension(20, 0)));
         topPanel.add(new JLabel("Target Phone IP:"));
-        ipField = new JTextField(15);
-        JButton connectBtn = new JButton("Set Target");
         
+        // Replaced JTextField with JComboBox
+        ipDropdown = new JComboBox<>();
+        ipDropdown.setEditable(true); // Allow manual typing just in case
+        ipDropdown.setPreferredSize(new Dimension(130, 25));
+        topPanel.add(ipDropdown);
+        
+        JButton connectBtn = new JButton("Set Target");
         connectBtn.addActionListener(e -> {
-            String ip = ipField.getText().trim();
-            if (!ip.isEmpty()) {
-                targetIp = ip;
+            String ip = (String) ipDropdown.getSelectedItem();
+            if (ip != null && !ip.trim().isEmpty()) {
+                targetIp = ip.trim();
                 log("Target IP manually set to: " + targetIp);
             }
         });
-        
-        topPanel.add(ipField);
         topPanel.add(connectBtn);
         
+        // Add note for the user
+        JLabel noteLabel = new JLabel("(Press 'r' to refresh list)");
+        noteLabel.setFont(new Font("Arial", Font.ITALIC, 11));
+        noteLabel.setForeground(Color.GRAY);
+        topPanel.add(noteLabel);
+        
         add(topPanel, BorderLayout.NORTH);
+
+        // Global Key Listener for the 'r' key
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(e -> {
+            if (e.getID() == KeyEvent.KEY_PRESSED && e.getKeyCode() == KeyEvent.VK_R) {
+                // Ignore if the user is typing an IP address manually inside the text box
+                Component focusOwner = KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner();
+                if (focusOwner instanceof javax.swing.text.JTextComponent) {
+                    return false;
+                }
+                scanNetworkForDevices();
+                return true;
+            }
+            return false;
+        });
 
         systemClipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
         
@@ -69,6 +95,52 @@ public class ClipboardSyncDesktop extends JFrame {
         startFastPoller();
 
         startServer();
+        
+        // Do an initial scan on startup
+        scanNetworkForDevices();
+    }
+    
+    // --- NETWORK SCANNER ---
+    private void scanNetworkForDevices() {
+        log("Scanning local network for Clipboard Sync devices...");
+        ipDropdown.removeAllItems();
+        String localIp = getLocalIpAddress();
+        if (localIp.equals("Unknown")) {
+            log("Cannot determine local IP.");
+            return;
+        }
+
+        // Get the subnet (e.g., 192.168.1.)
+        String subnet = localIp.substring(0, localIp.lastIndexOf('.') + 1);
+
+        new Thread(() -> {
+            // Use 50 threads to quickly check all 255 IPs on the subnet
+            ExecutorService executor = Executors.newFixedThreadPool(50);
+            for (int i = 1; i <= 254; i++) {
+                final String testIp = subnet + i;
+                executor.submit(() -> {
+                    try (Socket s = new Socket()) {
+                        // Check if the device is running our app (listening on port 8888)
+                        s.connect(new InetSocketAddress(testIp, 8888), 300);
+                        SwingUtilities.invokeLater(() -> {
+                            boolean exists = false;
+                            for(int j = 0; j < ipDropdown.getItemCount(); j++) {
+                                if(ipDropdown.getItemAt(j).equals(testIp)) exists = true;
+                            }
+                            if(!exists) {
+                                ipDropdown.addItem(testIp);
+                                log("Found device: " + testIp);
+                            }
+                        });
+                    } catch (Exception ignored) { }
+                });
+            }
+            executor.shutdown();
+            try {
+                executor.awaitTermination(2, TimeUnit.SECONDS);
+                SwingUtilities.invokeLater(() -> log("Network scan complete."));
+            } catch (InterruptedException ignored) {}
+        }).start();
     }
 
     private void startFastPoller() {
@@ -123,7 +195,14 @@ public class ClipboardSyncDesktop extends JFrame {
                     if (targetIp == null || !targetIp.equals(connectedIp)) {
                         targetIp = connectedIp;
                         SwingUtilities.invokeLater(() -> {
-                            ipField.setText(targetIp);
+                            // Automatically select the device in the dropdown
+                            boolean exists = false;
+                            for(int j = 0; j < ipDropdown.getItemCount(); j++) {
+                                if(ipDropdown.getItemAt(j).equals(targetIp)) exists = true;
+                            }
+                            if(!exists) ipDropdown.addItem(targetIp);
+                            
+                            ipDropdown.setSelectedItem(targetIp);
                             log("Auto-detected Phone IP: " + targetIp);
                         });
                     }
