@@ -34,6 +34,7 @@ public class ClipboardSyncDesktop extends JFrame {
     // Deduplication Hashes
     private volatile String lastTextHash = "";
     private volatile int lastImageHash = 0;
+    private volatile String lastFileHash = ""; // ADD THIS
 
     public ClipboardSyncDesktop() {
         setTitle("PC Clipboard Sync Server");
@@ -272,20 +273,29 @@ public class ClipboardSyncDesktop extends JFrame {
                     if (fileList != null && !fileList.isEmpty()) {
                         File file = fileList.get(0); // Send the first file copied
                         
-                        byte[] fileBytes = Files.readAllBytes(file.toPath());
-                        byte[] nameBytes = file.getName().getBytes("UTF-8");
+                        String filePath = file.getAbsolutePath();
                         
-                        // Build Payload: [Name Length (4 bytes)] + [Name Bytes] + [File Bytes]
-                        ByteBuffer buffer = ByteBuffer.allocate(4 + nameBytes.length + fileBytes.length);
-                        buffer.putInt(nameBytes.length);
-                        buffer.put(nameBytes);
-                        buffer.put(fileBytes);
+                        // ONLY SEND IF IT'S A NEW FILE
+                        if (!filePath.equals(lastFileHash)) {
+                            lastFileHash = filePath; // Update the hash so it doesn't loop
+                            
+                            byte[] fileBytes = Files.readAllBytes(file.toPath());
+                            byte[] nameBytes = file.getName().getBytes("UTF-8");
+                            
+                            // Build Payload
+                            ByteBuffer buffer = ByteBuffer.allocate(4 + nameBytes.length + fileBytes.length);
+                            buffer.putInt(nameBytes.length);
+                            buffer.put(nameBytes);
+                            buffer.put(fileBytes);
+                            
+                            log("Sending File: " + file.getName() + "...");
+                            sendDataToIp(targetIp, 4, buffer.array()); // Type 4 = Generic File
+                            
+                            // Reset the other hashes
+                            lastImageHash = 0;
+                            lastTextHash = ""; 
+                        }
                         
-                        log("Sending File: " + file.getName() + "...");
-                        sendDataToIp(targetIp, 4, buffer.array()); // Type 4 = Generic File
-                        
-                        lastImageHash = 0;
-                        lastTextHash = file.getName(); // Hack to prevent immediate bounce-back
                         isProcessing.set(false);
                         return;
                     }
@@ -321,6 +331,7 @@ public class ClipboardSyncDesktop extends JFrame {
                             sendDataToIp(targetIp, 2, baos.toByteArray());
                             
                             lastTextHash = ""; // Reset text hash
+                            lastFileHash = ""; // ADD THIS: Reset file hash
                         }
                         // If hash matches, do nothing (we already sent it)
                     }
@@ -338,6 +349,7 @@ public class ClipboardSyncDesktop extends JFrame {
                         log("Sending Text to Phone...");
                         sendDataToIp(targetIp, 1, text.getBytes("UTF-8"));
                         lastImageHash = 0; // Reset image hash
+                        lastFileHash = ""; // ADD THIS: Reset file hash
                     }
                 } catch (Exception e) {
                     // Text read failed
