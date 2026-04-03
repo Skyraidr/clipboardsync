@@ -1,5 +1,8 @@
 package application;
 
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.io.File;
 import javax.swing.*;
 import java.awt.*;
 import java.awt.datatransfer.*;
@@ -63,6 +66,10 @@ public class ClipboardSyncDesktop extends JFrame {
             }
         });
         topPanel.add(connectBtn);
+        
+        JButton clearBtn = new JButton("Clear Files");
+        clearBtn.addActionListener(e -> clearSyncedFiles());
+        topPanel.add(clearBtn);
         
         // Add note for the user
         JLabel noteLabel = new JLabel("(Press 'r' to refresh list)");
@@ -141,6 +148,22 @@ public class ClipboardSyncDesktop extends JFrame {
                 SwingUtilities.invokeLater(() -> log("Network scan complete."));
             } catch (InterruptedException ignored) {}
         }).start();
+    }
+    
+    private void clearSyncedFiles() {
+        File syncFolder = new File(System.getProperty("user.home"), "Downloads" + File.separator + "ClipboardSync");
+        if (syncFolder.exists() && syncFolder.isDirectory()) {
+            File[] files = syncFolder.listFiles();
+            if (files != null) {
+                int count = 0;
+                for (File f : files) {
+                    if (f.delete()) count++;
+                }
+                log("Cleared " + count + " files from ClipboardSync folder.");
+            }
+        } else {
+            log("No synced files found to clear.");
+        }
     }
 
     private void startFastPoller() {
@@ -244,7 +267,31 @@ public class ClipboardSyncDesktop extends JFrame {
 
             // 1. FILE HANDLER
             if (t.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) {
-                // (File logic same as before, omitted for brevity, usually manual copy works fine)
+                try {
+                    java.util.List<File> fileList = (java.util.List<File>) t.getTransferData(DataFlavor.javaFileListFlavor);
+                    if (fileList != null && !fileList.isEmpty()) {
+                        File file = fileList.get(0); // Send the first file copied
+                        
+                        byte[] fileBytes = Files.readAllBytes(file.toPath());
+                        byte[] nameBytes = file.getName().getBytes("UTF-8");
+                        
+                        // Build Payload: [Name Length (4 bytes)] + [Name Bytes] + [File Bytes]
+                        ByteBuffer buffer = ByteBuffer.allocate(4 + nameBytes.length + fileBytes.length);
+                        buffer.putInt(nameBytes.length);
+                        buffer.put(nameBytes);
+                        buffer.put(fileBytes);
+                        
+                        log("Sending File: " + file.getName() + "...");
+                        sendDataToIp(targetIp, 4, buffer.array()); // Type 4 = Generic File
+                        
+                        lastImageHash = 0;
+                        lastTextHash = file.getName(); // Hack to prevent immediate bounce-back
+                        isProcessing.set(false);
+                        return;
+                    }
+                } catch (Exception e) {
+                    log("File read failed: " + e.getMessage());
+                }
             }
 
             // 2. IMAGE HANDLER (With Fast Hash Check)
@@ -361,6 +408,28 @@ public class ClipboardSyncDesktop extends JFrame {
                         systemClipboard.setContents(new ImageTransferable(image), null);
                         log("Received Image");
                     }
+                }
+                else if (type == 4) { // Generic File
+                    ByteBuffer bufferWrapper = ByteBuffer.wrap(buffer);
+                    
+                    // Extract Filename
+                    int nameLen = bufferWrapper.getInt();
+                    byte[] nameBytes = new byte[nameLen];
+                    bufferWrapper.get(nameBytes);
+                    String fileName = new String(nameBytes, "UTF-8");
+                    
+                 // Extract File Data
+                    byte[] fileBytes = new byte[buffer.length - 4 - nameLen];
+                    bufferWrapper.get(fileBytes);
+
+                    // Save to a DEDICATED subfolder to prevent deleting the user's actual downloads
+                    File downloadsFolder = new File(System.getProperty("user.home"), "Downloads" + File.separator + "ClipboardSync");
+                    if (!downloadsFolder.exists()) {
+                        downloadsFolder.mkdirs(); // Create the folder if it doesn't exist
+                    }
+
+                    File outFile = new File(downloadsFolder, fileName);
+                    Files.write(outFile.toPath(), fileBytes);
                 }
             } finally {
                 // Wait a bit for clipboard to settle before letting poller run again
