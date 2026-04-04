@@ -443,8 +443,13 @@ public class ClipboardSyncDesktop extends JFrame {
                     File outFile = new File(downloadsFolder, fileName);
                     Files.write(outFile.toPath(), fileBytes);
                     
-                    // ---> YOU MISSED THESE TWO LINES <---
-                    systemClipboard.setContents(new StringSelection(outFile.getAbsolutePath()), null);
+                 // ---> UPDATE THESE LINES <---
+                    // 1. Update the hash so the poller ignores this new clipboard content
+                    lastFileHash = outFile.getAbsolutePath();
+                    
+                    // 2. Put the actual FILE on the clipboard, not just the string path
+                    systemClipboard.setContents(new FileTransferable(outFile), null);
+                    
                     log("Received File: " + fileName + " (Saved to Downloads/ClipboardSync)");
                 }
             } finally {
@@ -467,6 +472,31 @@ public class ClipboardSyncDesktop extends JFrame {
         public Object getTransferData(DataFlavor flavor) throws UnsupportedFlavorException {
             if (!isDataFlavorSupported(flavor)) throw new UnsupportedFlavorException(flavor);
             return image;
+        }
+    }
+    
+    static class FileTransferable implements Transferable {
+        private java.util.List<File> fileList;
+
+        public FileTransferable(File file) {
+            this.fileList = new java.util.ArrayList<>();
+            this.fileList.add(file);
+        }
+
+        @Override
+        public DataFlavor[] getTransferDataFlavors() {
+            return new DataFlavor[]{DataFlavor.javaFileListFlavor};
+        }
+
+        @Override
+        public boolean isDataFlavorSupported(DataFlavor flavor) {
+            return DataFlavor.javaFileListFlavor.equals(flavor);
+        }
+
+        @Override
+        public Object getTransferData(DataFlavor flavor) throws UnsupportedFlavorException {
+            if (!isDataFlavorSupported(flavor)) throw new UnsupportedFlavorException(flavor);
+            return fileList;
         }
     }
     
