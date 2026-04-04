@@ -430,18 +430,22 @@ public class ClipboardSyncDesktop extends JFrame {
                     bufferWrapper.get(nameBytes);
                     String fileName = new String(nameBytes, "UTF-8");
                     
-                 // Extract File Data
+                    // Extract File Data
                     byte[] fileBytes = new byte[buffer.length - 4 - nameLen];
                     bufferWrapper.get(fileBytes);
 
-                    // Save to a DEDICATED subfolder to prevent deleting the user's actual downloads
+                    // Save to a DEDICATED subfolder
                     File downloadsFolder = new File(System.getProperty("user.home"), "Downloads" + File.separator + "ClipboardSync");
                     if (!downloadsFolder.exists()) {
-                        downloadsFolder.mkdirs(); // Create the folder if it doesn't exist
+                        downloadsFolder.mkdirs(); 
                     }
 
                     File outFile = new File(downloadsFolder, fileName);
                     Files.write(outFile.toPath(), fileBytes);
+                    
+                    // ---> YOU MISSED THESE TWO LINES <---
+                    systemClipboard.setContents(new StringSelection(outFile.getAbsolutePath()), null);
+                    log("Received File: " + fileName + " (Saved to Downloads/ClipboardSync)");
                 }
             } finally {
                 // Wait a bit for clipboard to settle before letting poller run again
