@@ -171,9 +171,10 @@ public class ClipboardSyncDesktop extends JFrame {
         scanNetworkForDevices();
 
         // Auto-reconnect: announce ourselves, listen for paired phones, and watch for network changes
+        // (Restore BEFORE listening, so an early beacon from the phone can't be overwritten by "Waiting...")
         loadPairedPhone();
+        restorePairedPhone();
         startPresence();
-        new Thread(this::restorePairedPhone).start();
     }
 
     // --- QR PAIRING ---
