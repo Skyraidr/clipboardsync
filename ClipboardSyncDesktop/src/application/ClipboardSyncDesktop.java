@@ -10,6 +10,7 @@ import java.awt.event.KeyEvent;
 import java.awt.image.BufferedImage;
 import java.io.*;
 import java.net.*;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.LinkedHashSet;
@@ -17,10 +18,12 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.prefs.Preferences;
 import javax.imageio.ImageIO;
 
 import io.nayuki.qrcodegen.QrCode;
@@ -40,6 +43,33 @@ public class ClipboardSyncDesktop extends JFrame {
     private static final String PAIR_URI_PREFIX = "clipsync://pair";
     private static final int MAX_QR_IPS = 4;     // Keep the QR code small: fewer modules = faster scanning
     private static final int QR_TARGET_PX = 260;
+
+    // --- AUTO-RECONNECT (presence beacons) ---
+    // Every few seconds, and immediately when the network changes, each app broadcasts a tiny UDP message:
+    //   CLIPSYNC1|<D=desktop or P=phone>|<permanent device id>|<name>
+    // The sender's current IP is taken from the packet itself, so when a paired device shows up at a
+    // new address the other side simply updates the IP it sends to. No restart or re-scan needed.
+    private static final int PRESENCE_PORT = 8889;
+    private static final String PRESENCE_MAGIC = "CLIPSYNC1";
+    private static final long PRESENCE_INTERVAL_MS = 3000;
+    private static final long PHONE_OFFLINE_AFTER_MS = 75000; // Phones announce every 30s while in the background
+    private static final String ID_PATTERN = "[A-Za-z0-9_-]{1,64}";
+
+    // Remembers this PC's id and the paired phone across restarts
+    private final Preferences settings = Preferences.userNodeForPackage(ClipboardSyncDesktop.class);
+    private final String deviceId = loadOrCreateDeviceId();
+
+    private volatile String pairedPhoneId;
+    private volatile String pairedPhoneName;
+    private volatile String pairedPhoneIp;
+    private volatile long lastPhoneSeenAt = 0;
+    private volatile boolean phoneBeaconSeen = false; // Only phones with auto-reconnect send beacons
+    private volatile boolean phoneOnline = false;
+
+    private volatile DatagramSocket presenceSocket;
+    private final Object presenceWake = new Object();
+    private boolean presenceWakeRequested = false; // Guarded by presenceWake
+    private volatile List<String> lastKnownIps = new ArrayList<>();
 
     private JTextArea logArea;
     private ServerSocket serverSocket;
@@ -139,6 +169,12 @@ public class ClipboardSyncDesktop extends JFrame {
 
         // Do an initial scan on startup
         scanNetworkForDevices();
+
+        // Auto-reconnect: announce ourselves, listen for paired phones, and watch for network changes
+        // (Restore BEFORE listening, so an early beacon from the phone can't be overwritten by "Waiting...")
+        loadPairedPhone();
+        restorePairedPhone();
+        startPresence();
     }
 
     // --- QR PAIRING ---
@@ -222,7 +258,7 @@ public class ClipboardSyncDesktop extends JFrame {
     private String buildPairingPayload(List<String> ips) throws UnsupportedEncodingException {
         // Encode spaces as %20 (not '+') so every URI decoder reads the name the same way
         String name = URLEncoder.encode(getDesktopName(), "UTF-8").replace("+", "%20");
-        return PAIR_URI_PREFIX + "?v=1&n=" + name + "&ip=" + String.join(",", ips);
+        return PAIR_URI_PREFIX + "?v=1&n=" + name + "&id=" + deviceId + "&ip=" + String.join(",", ips);
     }
 
     private BufferedImage renderQrCode(QrCode qr) {
@@ -240,7 +276,11 @@ public class ClipboardSyncDesktop extends JFrame {
         return img;
     }
 
+    private static volatile String cachedDesktopName;
+
     private static String getDesktopName() {
+        String cached = cachedDesktopName;
+        if (cached != null) return cached;
         String name = System.getenv("COMPUTERNAME");
         if (name == null || name.trim().isEmpty()) name = System.getenv("HOSTNAME");
         if (name == null || name.trim().isEmpty()) {
@@ -250,7 +290,9 @@ public class ClipboardSyncDesktop extends JFrame {
         }
         if (name == null || name.trim().isEmpty()) name = "Desktop";
         name = name.trim();
-        return name.length() > 40 ? name.substring(0, 40) : name;
+        name = name.length() > 40 ? name.substring(0, 40) : name;
+        cachedDesktopName = name;
+        return name;
     }
 
     // All IPv4 addresses a phone on the same network could reach us on, best guesses first.
@@ -607,7 +649,7 @@ public class ClipboardSyncDesktop extends JFrame {
     }
 
     private void sendDataToIp(String ip, int type, byte[] data) {
-        try (Socket socket = new Socket(ip, PORT);
+        try (Socket socket = connectTo(ip);
              DataOutputStream out = new DataOutputStream(socket.getOutputStream())) {
             out.writeInt(type);
             out.writeInt(data.length);
@@ -616,6 +658,18 @@ public class ClipboardSyncDesktop extends JFrame {
             log("Sent Successfully!");
         } catch (IOException e) {
             log("Send Failed: " + e.getMessage());
+        }
+    }
+
+    // Fails after 3 seconds instead of the OS default (~20s) if the phone has gone away
+    private static Socket connectTo(String ip) throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.connect(new InetSocketAddress(ip, PORT), 3000);
+            return socket;
+        } catch (IOException e) {
+            socket.close();
+            throw e;
         }
     }
 
@@ -705,39 +759,29 @@ public class ClipboardSyncDesktop extends JFrame {
     }
 
     // A phone scanned our QR code: make it the target, then prove the Desktop -> Phone direction works too.
-    private void handlePairRequest(String phoneIp, String rawPhoneName) {
-        String phoneName = rawPhoneName.replaceAll("\\p{Cntrl}", "").trim();
-        if (phoneName.isEmpty()) phoneName = "Phone";
-        if (phoneName.length() > 60) phoneName = phoneName.substring(0, 60);
+    // Data = phone name, optionally followed by "\n" and the phone's permanent id (used for auto-reconnect).
+    private void handlePairRequest(String phoneIp, String rawPayload) {
+        String[] parts = rawPayload.split("\n", 2);
+        String phoneName = cleanName(parts[0], "Phone");
+        String phoneId = parts.length > 1 ? parts[1].trim() : "";
         final String displayName = phoneName;
 
-        // Hold the clipboard lock while switching target so whatever is ALREADY on the
-        // desktop clipboard isn't pushed to the phone the instant it pairs.
         log("QR pairing request from " + displayName + " (" + phoneIp + ")");
-        long waitUntil = System.currentTimeMillis() + 5000;
-        boolean gotLock = false;
-        while (!gotLock && System.currentTimeMillis() < waitUntil) {
-            gotLock = isProcessing.compareAndSet(false, true);
-            if (!gotLock) {
-                try { Thread.sleep(20); } catch (InterruptedException e) { break; }
-            }
-        }
-        if (!gotLock) isProcessing.set(true);
-        try {
-            primeHashesFromClipboard();
-            registerPeer(phoneIp);
-        } finally {
-            isProcessing.set(false);
-        }
+        // Make sure whatever is ALREADY on the desktop clipboard isn't pushed to the phone the instant it pairs
+        switchTargetWithoutResend(phoneIp);
 
-        SwingUtilities.invokeLater(() -> pairedLabel.setText("<html><body style='width:200px;text-align:center'>Paired phone:<br>"
-                + escapeHtml(displayName) + " (" + phoneIp + ")<br><i>Confirming...</i></body></html>"));
+        pairedPhoneId = phoneId.matches(ID_PATTERN) ? phoneId : null;
+        pairedPhoneName = displayName;
+        pairedPhoneIp = phoneIp;
+        phoneBeaconSeen = false;
+        lastPhoneSeenAt = System.currentTimeMillis();
+        savePairedPhone();
+        setPairedStatus("<i>Confirming...</i>");
 
         // Reply on a NEW connection to the phone's own server, exactly like clipboard data travels
         boolean reachable = false;
         String error = null;
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(phoneIp, PORT), 3000);
+        try (Socket socket = connectTo(phoneIp)) {
             DataOutputStream out = new DataOutputStream(socket.getOutputStream());
             byte[] nameBytes = getDesktopName().getBytes("UTF-8");
             out.writeInt(TYPE_PAIR_ACK);
@@ -749,18 +793,278 @@ public class ClipboardSyncDesktop extends JFrame {
             error = e.getMessage();
         }
 
-        final boolean twoWay = reachable;
-        SwingUtilities.invokeLater(() -> pairedLabel.setText("<html><body style='width:200px;text-align:center'>Paired phone:<br>"
-                + escapeHtml(displayName) + " (" + phoneIp + ")<br>"
-                + (twoWay ? "<font color='#2e7d32'>Connected both ways</font>"
-                          : "<font color='#c62828'>Phone not reachable from this PC</font>")
-                + "</body></html>"));
-        if (twoWay) {
+        phoneOnline = reachable;
+        setPairedStatus(reachable ? "<font color='#2e7d32'>Connected both ways</font>"
+                                  : "<font color='#c62828'>Phone not reachable from this PC</font>");
+        if (reachable) {
             log("Paired with " + displayName + " (" + phoneIp + ") - connected both ways. Copy something to sync!");
         } else {
             log("Paired with " + displayName + " (" + phoneIp + "), but this PC could not reach the phone (" + error
                     + "). Keep the Clipboard Sync app open on the phone and make sure both are on the same Wi-Fi.");
         }
+        wakePresence(); // Announce ourselves right away
+    }
+
+    // Changes the send target without pushing what is already on the desktop clipboard
+    private void switchTargetWithoutResend(String ip) {
+        // Hold the clipboard lock so the poller can't send between priming and switching
+        long waitUntil = System.currentTimeMillis() + 5000;
+        boolean gotLock = false;
+        while (!gotLock && System.currentTimeMillis() < waitUntil) {
+            gotLock = isProcessing.compareAndSet(false, true);
+            if (!gotLock) {
+                try { Thread.sleep(20); } catch (InterruptedException e) { break; }
+            }
+        }
+        if (!gotLock) isProcessing.set(true);
+        try {
+            primeHashesFromClipboard();
+            registerPeer(ip);
+        } finally {
+            isProcessing.set(false);
+        }
+    }
+
+    private void setPairedStatus(String statusHtml) {
+        final String name = pairedPhoneName;
+        final String ip = pairedPhoneIp;
+        SwingUtilities.invokeLater(() -> {
+            if (name == null || ip == null) {
+                pairedLabel.setText("Paired phone: none");
+            } else {
+                pairedLabel.setText("<html><body style='width:200px;text-align:center'>Paired phone:<br>"
+                        + escapeHtml(name) + " (" + ip + ")"
+                        + (statusHtml == null ? "" : "<br>" + statusHtml) + "</body></html>");
+            }
+        });
+    }
+
+    // --- AUTO-RECONNECT ---
+    private String loadOrCreateDeviceId() {
+        String id = settings.get("deviceId", null);
+        if (id == null || !id.matches(ID_PATTERN)) {
+            id = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+            settings.put("deviceId", id);
+            flushSettings();
+        }
+        return id;
+    }
+
+    private void loadPairedPhone() {
+        String ip = settings.get("pairedPhoneIp", null);
+        if (ip == null || !isIpv4(ip)) return;
+        String id = settings.get("pairedPhoneId", null);
+        pairedPhoneId = (id != null && id.matches(ID_PATTERN)) ? id : null;
+        pairedPhoneName = cleanName(settings.get("pairedPhoneName", null), "Phone");
+        pairedPhoneIp = ip;
+    }
+
+    private void savePairedPhone() {
+        if (pairedPhoneId != null) settings.put("pairedPhoneId", pairedPhoneId);
+        else settings.remove("pairedPhoneId");
+        if (pairedPhoneName != null) settings.put("pairedPhoneName", pairedPhoneName);
+        if (pairedPhoneIp != null) settings.put("pairedPhoneIp", pairedPhoneIp);
+        flushSettings();
+    }
+
+    private void flushSettings() {
+        try {
+            settings.flush();
+        } catch (Exception e) {
+            log("Could not save settings: " + e.getMessage());
+        }
+    }
+
+    // After a restart, go straight back to the phone we were paired with (beacons correct the IP if it changed)
+    private void restorePairedPhone() {
+        String ip = pairedPhoneIp;
+        if (ip == null) return;
+        if (targetIp == null) switchTargetWithoutResend(ip);
+        log("Remembered phone: " + pairedPhoneName + " (" + ip + "). It reconnects automatically, even if its IP changes.");
+        setPairedStatus(pairedPhoneId != null ? "<i>Waiting for phone...</i>" : null);
+    }
+
+    private void startPresence() {
+        try {
+            DatagramSocket socket = new DatagramSocket(PRESENCE_PORT);
+            socket.setBroadcast(true);
+            presenceSocket = socket;
+            Thread rx = new Thread(this::presenceReceiveLoop, "presence-receive");
+            rx.setDaemon(true);
+            rx.start();
+        } catch (IOException e) {
+            log("Auto-reconnect can't listen on UDP port " + PRESENCE_PORT + " (" + e.getMessage()
+                    + "). Is another copy of this app running?");
+            try {
+                DatagramSocket sendOnly = new DatagramSocket();
+                sendOnly.setBroadcast(true);
+                presenceSocket = sendOnly;
+            } catch (IOException ignored) { }
+        }
+        lastKnownIps = getCandidateIpAddresses();
+        Thread tx = new Thread(this::presenceAnnounceLoop, "presence-announce");
+        tx.setDaemon(true);
+        tx.start();
+    }
+
+    // Asks the announce loop to run now (e.g. right after pairing or a phone moved)
+    private void wakePresence() {
+        synchronized (presenceWake) {
+            presenceWakeRequested = true;
+            presenceWake.notifyAll();
+        }
+    }
+
+    private void presenceAnnounceLoop() {
+        while (true) {
+            try {
+                // 1. Has OUR address changed? (Wi-Fi switched, laptop woke up, new DHCP lease...)
+                List<String> ips = getCandidateIpAddresses();
+                if (!ips.equals(lastKnownIps)) {
+                    lastKnownIps = ips;
+                    if (ips.isEmpty()) {
+                        log("Network disconnected. Waiting for a connection...");
+                    } else {
+                        log("Network changed - this PC is now at " + String.join(", ", ips)
+                                + ". Paired phones reconnect automatically.");
+                    }
+                    refreshQrCode();
+                }
+
+                // 2. Tell everyone on the network where we are
+                sendPresenceBeacon();
+
+                // 3. Mark the paired phone as away if it stopped announcing itself
+                if (phoneBeaconSeen && phoneOnline
+                        && System.currentTimeMillis() - lastPhoneSeenAt > PHONE_OFFLINE_AFTER_MS) {
+                    phoneOnline = false;
+                    setPairedStatus("<font color='gray'>Not seen recently - is the app open?</font>");
+                }
+
+                synchronized (presenceWake) {
+                    if (!presenceWakeRequested) presenceWake.wait(PRESENCE_INTERVAL_MS);
+                    presenceWakeRequested = false;
+                }
+            } catch (InterruptedException e) {
+                return;
+            } catch (Exception e) {
+                // Never let a network hiccup stop auto-reconnect
+                try { Thread.sleep(PRESENCE_INTERVAL_MS); } catch (InterruptedException ie) { return; }
+            }
+        }
+    }
+
+    private void sendPresenceBeacon() {
+        DatagramSocket socket = presenceSocket;
+        if (socket == null) return;
+        byte[] data = (PRESENCE_MAGIC + "|D|" + deviceId + "|" + cleanName(getDesktopName(), "Desktop"))
+                .getBytes(StandardCharsets.UTF_8);
+
+        Set<InetAddress> targets = new LinkedHashSet<>();
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces != null && interfaces.hasMoreElements()) {
+                NetworkInterface iface = interfaces.nextElement();
+                try {
+                    if (iface.isLoopback() || !iface.isUp()) continue;
+                    for (InterfaceAddress ia : iface.getInterfaceAddresses()) {
+                        if (ia.getBroadcast() != null) targets.add(ia.getBroadcast()); // e.g. 192.168.1.255
+                    }
+                } catch (Exception ignored) { }
+            }
+        } catch (Exception ignored) { }
+        try {
+            targets.add(InetAddress.getByName("255.255.255.255"));
+            // Also send straight to the paired phone: works even where broadcasts are filtered
+            String phoneIp = pairedPhoneIp;
+            if (phoneIp != null) targets.add(InetAddress.getByName(phoneIp));
+        } catch (Exception ignored) { }
+
+        for (InetAddress target : targets) {
+            try {
+                socket.send(new DatagramPacket(data, data.length, target, PRESENCE_PORT));
+            } catch (Exception ignored) { } // No route on that interface right now
+        }
+    }
+
+    private void presenceReceiveLoop() {
+        byte[] buf = new byte[512];
+        while (true) {
+            DatagramSocket socket = presenceSocket;
+            if (socket == null || socket.isClosed()) return;
+            DatagramPacket packet = new DatagramPacket(buf, buf.length);
+            try {
+                socket.receive(packet);
+            } catch (IOException e) {
+                continue;
+            }
+            try {
+                if (!(packet.getAddress() instanceof Inet4Address)) continue;
+                String msg = new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8);
+                String[] f = msg.split("\\|", -1);
+                if (f.length < 4 || !PRESENCE_MAGIC.equals(f[0]) || !"P".equals(f[1])) continue;
+                String id = f[2];
+                if (!id.matches(ID_PATTERN) || id.equals(deviceId)) continue;
+                onPhoneSeen(id, cleanName(f[3], "Phone"), packet.getAddress().getHostAddress());
+            } catch (Exception ignored) { }
+        }
+    }
+
+    private void onPhoneSeen(String id, String name, String ip) {
+        if (!id.equals(pairedPhoneId)) {
+            // Not our paired phone: just offer it in the dropdown (replaces waiting for a network scan)
+            SwingUtilities.invokeLater(() -> {
+                for (int j = 0; j < ipDropdown.getItemCount(); j++) {
+                    if (ip.equals(ipDropdown.getItemAt(j))) return;
+                }
+                ipDropdown.addItem(ip);
+                log("Found device: " + name + " (" + ip + ")");
+            });
+            return;
+        }
+
+        lastPhoneSeenAt = System.currentTimeMillis();
+        phoneBeaconSeen = true;
+        String oldIp = pairedPhoneIp;
+        boolean moved = !ip.equals(oldIp);
+        boolean renamed = !name.equals(pairedPhoneName);
+        if (moved || renamed) {
+            pairedPhoneIp = ip;
+            pairedPhoneName = name;
+            savePairedPhone();
+        }
+
+        if (moved) {
+            // Follow the phone, unless the user deliberately picked a different target
+            String current = targetIp;
+            boolean follow = current == null || current.equals(oldIp);
+            if (follow) switchTargetWithoutResend(ip);
+            log("Phone " + name + " is now at " + ip + (follow ? " - reconnected automatically." : "."));
+            wakePresence(); // Let the phone know where we are right away too
+        } else if (targetIp == null) {
+            switchTargetWithoutResend(ip);
+        }
+
+        if (moved || renamed || !phoneOnline) {
+            phoneOnline = true;
+            setPairedStatus("<font color='#2e7d32'>Connected</font>");
+        }
+    }
+
+    private static String cleanName(String raw, String fallback) {
+        if (raw == null) return fallback;
+        String name = raw.replaceAll("\\p{Cntrl}", "").replace('|', '-').trim();
+        if (name.isEmpty()) return fallback;
+        return name.length() > 60 ? name.substring(0, 60) : name;
+    }
+
+    private static boolean isIpv4(String ip) {
+        String[] parts = ip.split("\\.", -1);
+        if (parts.length != 4) return false;
+        for (String p : parts) {
+            if (!p.matches("[0-9]{1,3}") || Integer.parseInt(p) > 255) return false;
+        }
+        return true;
     }
 
     private static String escapeHtml(String s) {
