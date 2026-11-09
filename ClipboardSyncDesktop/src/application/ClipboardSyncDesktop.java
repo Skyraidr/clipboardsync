@@ -189,7 +189,7 @@ public class ClipboardSyncDesktop extends JFrame {
         title.setAlignmentX(Component.CENTER_ALIGNMENT);
 
         JLabel instructions = new JLabel("<html><body style='width:200px;text-align:center'>"
-                + "Open Clipboard Sync on your phone, tap <b>Scan Desktop QR Code</b> and point it here."
+                + "Open Clipboard Sync on your phone, tap <b>Scan QR Code</b> and point it here."
                 + "</body></html>");
         instructions.setHorizontalAlignment(SwingConstants.CENTER);
         instructions.setAlignmentX(Component.CENTER_ALIGNMENT);
